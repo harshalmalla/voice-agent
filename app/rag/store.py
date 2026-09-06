@@ -203,8 +203,9 @@ async def upsert_chunks(collection_name: str, records: list[dict]) -> int:
     Each record is a plain dict that must already contain `EMBEDDING_FIELD`
     (a list of `config.EMBEDDING_DIMENSION` floats from
     `embeddings.embed_documents`) alongside whatever metadata that collection
-    uses — `text` and `source` for `documents`, `text`, `role`, `session_id`
-    and a timestamp for `memory`.
+    uses — `text`, `source`, `chunk_index` and `timestamp` for `documents`;
+    `text`, `user_text`, `assistant_text`, `session_id` and `timestamp` for
+    `memory` (see the projected field list on `_build_search_pipeline`).
 
     WHY ONE BULK CALL AND NOT A LOOP OF `insert_one`:
     the cost of a write here is dominated by the network round trip to Atlas,
@@ -281,6 +282,72 @@ async def upsert_chunks(collection_name: str, records: list[dict]) -> int:
     return written
 
 
+async def delete_chunks_by_source(collection_name: str, source: str) -> int:
+    """Remove every chunk that was ingested from one source file.
+
+    Exists to make re-ingestion idempotent. `app/rag/ingest.py` calls this
+    immediately before inserting a file's new chunks, so running the ingest
+    CLI twice replaces a document's chunks rather than doubling them.
+    Duplicates are not merely wasted storage: identical chunks compete for the
+    same top-k slots, so the LLM receives one paragraph four times instead of
+    four different ones, and retrieval quality degrades with every re-run.
+
+    Delete-then-insert rather than a keyed upsert, because re-chunking a file
+    after a `CHUNK_SIZE` change renumbers everything — a file that produced 40
+    chunks and now produces 30 would leave chunks 30-39 of the previous run
+    orphaned in the collection, matching queries with text that no longer
+    reflects the source.
+
+    Uses `delete_many` (a genuine coroutine on `AsyncCollection`, verified
+    with `inspect.iscoroutinefunction`) so the whole removal is one round trip
+    to Atlas, for the same reason `upsert_chunks` batches its writes.
+
+    Deleting nothing is a normal, successful outcome — it is what the first
+    ingestion of a new file does — so a zero return is not an error and this
+    does not raise for it.
+
+    Args:
+        collection_name: Usually `config.DOCUMENTS_COLLECTION`.
+        source: The exact value stored in the `source` field, i.e. the
+            filename as written by `ingest.py`.
+
+    Returns:
+        How many documents were deleted.
+
+    Raises:
+        ValueError: if `source` is empty. An empty filter would match and
+            delete the ENTIRE collection, which is never what a caller that
+            forgot to pass a filename meant.
+        RuntimeError: if MONGODB_URI is unset.
+        VectorStoreError: if the delete fails.
+    """
+    if not source:
+        raise ValueError(
+            "delete_chunks_by_source() requires a non-empty source — an empty "
+            "value would match every document in the collection."
+        )
+
+    collection = _get_collection(collection_name)
+
+    try:
+        result = await collection.delete_many({"source": source})
+    except PyMongoError as exc:
+        raise VectorStoreError(
+            f"Deleting existing chunks for source {source!r} from "
+            f"{config.MONGODB_DB_NAME}.{collection_name} failed: {exc}"
+        ) from exc
+
+    if result.deleted_count:
+        logger.info(
+            "Deleted %d existing chunks for source %r from %s.%s.",
+            result.deleted_count,
+            source,
+            config.MONGODB_DB_NAME,
+            collection_name,
+        )
+    return result.deleted_count
+
+
 def _build_search_pipeline(
     query_vector: list[float],
     limit: int,
@@ -350,6 +417,33 @@ def _build_search_pipeline(
     JSON-serializable — leaving it in makes the retrieved documents blow up
     the moment they're sent over the WebSocket or logged as JSON.
 
+    --- The projected field list ---
+    One whitelist serves both collections, because both are read back through
+    this one function. `$project` simply omits a listed field that a document
+    does not have, so a `documents` hit comes back without `session_id` and a
+    `memory` hit without `source`, with no error either way.
+
+      * `text`         — both. The chunk / the exchange; what reaches the LLM.
+      * `source`       — `documents`. The filename, used for citation.
+      * `chunk_index`  — `documents`. Position in the file, for ordering and
+                         provenance.
+      * `session_id`   — `memory`. The scope the pre-filter matched on.
+      * `user_text`,
+        `assistant_text` — `memory`. The halves of the exchange, kept apart
+                         from the combined `text` so a caller can display or
+                         replay them without re-parsing the combined string.
+      * `timestamp`    — both, deliberately one name for one concept
+                         (`ingest.py` and `memory.py` both write it), so this
+                         list does not have to carry two spellings of "when".
+
+    `role` is NOT projected because it is not stored: `memory.py` writes one
+    document per completed exchange rather than one per message — an
+    assistant answer retrieved without its question is often uninterpretable
+    ("Yes, about three weeks") — and a document containing both halves has no
+    single role. The field list here matches `ingest._build_records` and
+    `memory.add_turn` exactly; if either schema changes, this changes with it,
+    or retrieval starts dropping fields without saying so.
+
     Args:
         query_vector: The embedded question (from `embeddings.embed_query`).
         limit: How many documents to return.
@@ -377,8 +471,10 @@ def _build_search_pipeline(
                 "_id": 0,
                 "text": 1,
                 "source": 1,
+                "chunk_index": 1,
                 "session_id": 1,
-                "role": 1,
+                "user_text": 1,
+                "assistant_text": 1,
                 "timestamp": 1,
                 "score": {"$meta": "vectorSearchScore"},
             }

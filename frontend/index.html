@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Live Voice RAG Agent</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <div>
+          <h1>Live Voice RAG Agent</h1>
+          <p class="brand-sub">Retrieval, tools and speech over one live session</p>
+        </div>
+      </div>
+
+      <div class="topbar-controls">
+        <button id="mute-toggle" class="ghost-button" type="button" aria-pressed="false">
+          <span id="mute-label">Speech on</span>
+        </button>
+        <p class="status" id="connection-status" data-state="connecting" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="connection-text">Connecting</span>
+        </p>
+      </div>
+    </header>
+
+    <div id="banners" class="banners" aria-live="assertive"></div>
+
+    <main class="columns">
+      <section class="panel conversation-panel" aria-labelledby="conversation-heading">
+        <div class="panel-head">
+          <h2 id="conversation-heading">Conversation</h2>
+          <span class="panel-hint" id="session-label"></span>
+        </div>
+
+        <div id="conversation" class="conversation" aria-live="polite" aria-relevant="additions text">
+          <p class="empty-state" id="conversation-empty">
+            Hold the talk button, or type a question below, to start the session.
+          </p>
+        </div>
+
+        <div class="composer">
+          <div class="ptt-row">
+            <button id="ptt" class="ptt" type="button" aria-describedby="ptt-hint">
+              <span class="ptt-icon" aria-hidden="true"></span>
+              <span class="ptt-text">Hold to talk</span>
+              <span class="ptt-timer" id="ptt-timer" aria-hidden="true">0.0s</span>
+            </button>
+            <div class="level-meter" aria-hidden="true">
+              <div class="level-fill" id="level-fill"></div>
+            </div>
+            <p class="ptt-hint" id="ptt-hint">Hold the button or the spacebar while you speak.</p>
+          </div>
+
+          <form id="text-form" class="text-form" autocomplete="off">
+            <label class="visually-hidden" for="text-input">Type a question instead of speaking</label>
+            <input id="text-input" name="text" type="text" placeholder="Type a question instead" maxlength="2000">
+            <button id="text-send" class="send-button" type="submit">Send</button>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel activity-panel" aria-labelledby="activity-heading">
+        <div class="panel-head">
+          <h2 id="activity-heading">Activity trace</h2>
+          <button id="clear-activity" class="ghost-button small" type="button">Clear</button>
+        </div>
+        <div id="activity" class="activity">
+          <p class="empty-state">Retrieval hits, tool calls and results appear here as the agent works.</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
