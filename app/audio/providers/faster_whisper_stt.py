@@ -38,39 +38,11 @@ from app.config import WHISPER_COMPUTE_TYPE, WHISPER_MODEL_SIZE
 
 logger = logging.getLogger(__name__)
 
-# The value this provider stamps onto every TranscriptionResult it returns
-# (see `provider` in app/audio/types.py). Named here rather than inlined at
-# the construction site so the orchestrator and any dashboard code can
-# compare against the constant instead of re-typing the string literal —
-# a typo in a literal comparison fails silently, a typo in an imported name
-# fails at import.
 PROVIDER_NAME = "faster-whisper"
 
 
-# --- Lazy singleton model loader --------------------------------------------
-# Loading a WhisperModel means reading model weights off disk (or downloading
-# them on first run) and initializing a ctranslate2 inference session — that
-# takes real time (seconds, not milliseconds). Doing that at *import* time
-# would slow down importing this module even for code paths that never call
-# transcribe() at all (e.g. running an unrelated test file that merely
-# happens to import something that imports this). So we defer construction
-# until the first real call, and cache the instance in this module-level
-# variable for every call after that.
 _model: WhisperModel | None = None
 
-# Why `threading.Lock` and not `asyncio.Lock`: this module's `transcribe()`
-# is synchronous and CPU-bound (see its docstring below), so the orchestrator
-# is expected to call it via `asyncio.to_thread(transcribe, audio_bytes)`.
-# `asyncio.to_thread` runs the call in a worker thread from the default
-# executor's thread pool — with several WebSocket sessions transcribing
-# concurrently, `_get_model()` can genuinely be entered by more than one
-# *OS thread* at the same time, not just multiple coroutines interleaved on
-# one thread. An `asyncio.Lock` only protects against the latter (it's not
-# thread-safe and isn't even usable without a running event loop in the
-# calling thread), so it would do nothing to stop two threads from both
-# passing the "is it loaded yet?" check and each constructing their own
-# WhisperModel. A `threading.Lock` is the one that actually blocks a second
-# OS thread while the first is inside the critical section.
 _model_lock = threading.Lock()
 
 
@@ -144,21 +116,8 @@ def transcribe(audio_bytes: bytes) -> TranscriptionResult:
 
     model = _get_model()
 
-    # `audio` must be a path, a BinaryIO, or a numpy array — never raw bytes
-    # (confirmed via inspect.signature(WhisperModel.transcribe) against the
-    # installed package). io.BytesIO gives PyAV a seekable file-like object
-    # to demux the container from, with no temp file needed.
     segments, info = model.transcribe(io.BytesIO(audio_bytes))
 
-    # `segments` is a *generator*, not a list — faster-whisper decodes each
-    # segment lazily, only as you iterate. That's a nice property for
-    # streaming use cases (you can start acting on segment 1 before segment
-    # 2 has even been decoded), but it also means `info.language` is not
-    # fully reliable and no segment's text exists yet until the generator
-    # has actually been driven to completion. Since this app wants the
-    # whole transcript in one shot (not a live stream of partial segments),
-    # we exhaust the generator here with a single list comprehension rather
-    # than returning it to the caller half-consumed.
     full_text = " ".join(segment.text.strip() for segment in segments)
 
     logger.debug(

@@ -19,27 +19,8 @@ import logging
 
 from app.config import LOG_LEVEL
 
-# Format for every log line this app emits:
-#   2026-09-06 12:34:56,789 | INFO     | app.main | client connected
-# - asctime:   when it happened (essential once requests are concurrent —
-#              print() output has no way to tell you this).
-# - levelname: how serious it is, so you can grep for "ERROR" / "WARNING"
-#              instead of re-reading every line. `-8s` left-pads/pads the
-#              level name to 8 chars so the " | " columns line up visually
-#              even though "INFO" and "WARNING" are different lengths.
-# - name:      which module logged it (see `logging.getLogger(__name__)`
-#              in other modules) — tells you *where* to look in the code.
-# - message:   the actual content.
 _LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
 
-# Guards against configuring the root logger more than once. Without this,
-# calling setup_logging() a second time (e.g. `uvicorn --reload` re-running
-# module-level code, or a test suite that imports the app repeatedly in one
-# process) would attach a second StreamHandler to the root logger, and every
-# subsequent log line would then print twice, then three times, and so on.
-# A module-level flag is the simplest way to make the function idempotent:
-# it survives for the lifetime of the process, which is exactly the scope
-# we need ("has this process already set up logging?").
 _configured = False
 
 
@@ -69,16 +50,8 @@ def setup_logging() -> None:
 
     root_logger = logging.getLogger()
 
-    # Read the level from an env var (via config.py) rather than hardcoding
-    # it so you can turn on verbose DEBUG logging for one debugging session,
-    # or quiet things down to WARNING in production, without touching code
-    # or redeploying — just set LOG_LEVEL and restart the process.
     numeric_level = getattr(logging, LOG_LEVEL.upper(), None)
     if not isinstance(numeric_level, int):
-        # An invalid value (e.g. a typo like "INOF") should never crash the
-        # app on startup — logging is a diagnostic aid, not a critical
-        # dependency. Fall back to INFO and warn so the mistake is visible
-        # in the logs instead of silently doing the wrong thing forever.
         root_logger.warning(
             "Invalid LOG_LEVEL '%s'; falling back to INFO. "
             "Valid values: DEBUG, INFO, WARNING, ERROR, CRITICAL.",

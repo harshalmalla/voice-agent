@@ -33,19 +33,4 @@ class TranscriptionResult:
     language: str
     language_probability: float
 
-    # Which engine actually produced this transcript — "faster-whisper" or
-    # "sarvam" today. The orchestrator (app/audio/stt.py) can route the same
-    # audio to either provider depending on the detected language, so by the
-    # time a result reaches the WebSocket handler there is otherwise no way
-    # to tell which one it came from. Carrying it here makes the routing
-    # decision *observable*: the live dashboard can label a transcript with
-    # its engine, and a bug report ("this Hindi came back as gibberish") can
-    # be answered from the payload rather than by re-reading server logs.
-    #
-    # Deliberately REQUIRED — no default. A default like "unknown" would let
-    # a future provider be added, forget to identify itself, and silently
-    # emit mislabelled results that nobody notices until someone is trying
-    # to debug quality differences between engines. With no default, Python
-    # raises a TypeError at the construction site the moment a new provider
-    # is written, which is exactly where the fix belongs.
     provider: str

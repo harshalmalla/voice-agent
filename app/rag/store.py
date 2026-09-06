@@ -111,68 +111,11 @@ class VectorStoreError(RuntimeError):
     """
 
 
-# --- Document shape ----------------------------------------------------------
-# The field every stored embedding lives under, in both collections. It is a
-# module constant rather than a literal sprinkled through the file because it
-# appears in three places that MUST agree: the documents `upsert_chunks()`
-# writes, the `path` of the `$vectorSearch` stage, and the `path` of the
-# vector field in the index definition. If those three ever drift apart, Atlas
-# does not error — it just indexes nothing and returns nothing, which is a
-# miserable bug to chase.
 EMBEDDING_FIELD = "embedding"
 
-# Fields declared as `filter` type in the index, so they can be used in
-# `$vectorSearch`'s pre-filter (see `_build_search_pipeline`). A field that is
-# NOT declared here cannot be pre-filtered on — Atlas rejects the query rather
-# than silently ignoring the filter, which at least fails loudly.
-#   * `session_id` — scopes `memory` recall to the current conversation.
-#   * `source`     — lets `documents` be narrowed to one source file, useful
-#                    for "according to the handbook..." style questions.
-# Declaring a filter field the collection never uses is harmless (it just
-# indexes nothing), so one shared definition serves both collections.
 FILTER_FIELDS: tuple[str, ...] = ("session_id", "source")
 
 
-# --- The index definition ----------------------------------------------------
-# Built from config so it can never drift from what the rest of the code
-# expects. This is the single source of truth for the index shape, used both
-# by `ensure_vector_index()` (programmatic creation) and, when that isn't
-# possible, printed verbatim for the user to paste into the Atlas UI.
-#
-# WHY `numDimensions` MUST EQUAL config.EMBEDDING_DIMENSION:
-# an Atlas vector index is a physical data structure (an HNSW graph) built
-# over fixed-width coordinate vectors. Its width is baked in at creation. If
-# the index says 768 and you send a 3072-float query vector, Atlas rejects the
-# query outright — and the error talks about the *query vector*, which sends
-# people hunting through embeddings.py when the index is what's wrong. Worse
-# is the reverse-ish case: swapping the embedding MODEL while keeping the same
-# width. Nothing errors at all, because a vector's dimensionality says nothing
-# about which vector *space* it belongs to. Coordinates from model A are
-# meaningless distances away from coordinates from model B, so retrieval
-# silently returns plausible-looking nonsense. Changing the embedding model
-# therefore invalidates the entire index AND every stored vector: you must
-# re-embed the whole corpus and rebuild the index. There is no partial
-# migration — a collection holding vectors from two models is broken for
-# every query, not just for the new documents.
-#
-# WHY `similarity` IS "dotProduct":
-# the similarity metric has to match how the vectors were actually produced.
-# `embeddings.py::_normalize()` scales every vector it returns to unit length
-# (L2 norm == 1) precisely so this choice is safe. For unit vectors, cosine
-# similarity and the dot product are *mathematically identical*:
-#     cos(a, b) = (a · b) / (‖a‖‖b‖)   and   ‖a‖ = ‖b‖ = 1   =>   cos = a · b
-# so "cosine" here would compute the same ranking — it would just re-derive
-# and divide by norms it already knows are 1.0, on every comparison. Picking
-# `dotProduct` skips that redundant work.
-#
-# The corollary is the trap: this is only true *because* we normalize. If
-# `_normalize()` were ever removed, `dotProduct` would start ranking by
-# "similar AND long" rather than "similar", quietly favouring whichever chunks
-# happen to have large-magnitude embeddings. The two files are coupled; the
-# comment in each points at the other. (`euclidean` is the third option and is
-# also rank-equivalent to the other two on unit vectors, since
-# ‖a - b‖² = 2 - 2(a · b) — a monotonically decreasing function of the dot
-# product. It is the right choice only when magnitude carries real meaning.)
 VECTOR_INDEX_DEFINITION: dict[str, Any] = {
     "fields": [
         {
@@ -186,80 +129,12 @@ VECTOR_INDEX_DEFINITION: dict[str, Any] = {
 }
 
 
-# --- ANN tuning --------------------------------------------------------------
-# `numCandidates` vs `limit` — the single most important knob in this file,
-# and the one interviewers ask about.
-#
-# Atlas Vector Search is APPROXIMATE nearest neighbour (ANN), not exhaustive.
-# It does not compare your query vector against all N stored vectors; at that
-# scale it couldn't and stay fast. Instead it walks an HNSW graph — a layered
-# "small world" structure where each vector links to a handful of near
-# neighbours, plus a few long-range links in upper layers. A search enters at
-# the sparse top layer, greedily hops toward the query, descends a layer,
-# hops again, and so on. That's roughly O(log N) hops instead of O(N)
-# comparisons.
-#
-# Greedy graph traversal can get stuck in a local minimum: it reaches a vertex
-# whose neighbours are all worse than itself, and stops — even though a truly
-# nearer vector exists in a part of the graph it never touched. The defence is
-# to keep a priority queue of the best candidates seen so far and keep
-# exploring from all of them, not just the current best.
-#
-#   * `numCandidates` = how big that queue is. How many candidates the search
-#     is willing to consider before it stops looking.
-#   * `limit`         = how many of those survivors it actually returns.
-#
-# So the trade-off is RECALL vs LATENCY, and it is a genuine dial, not a
-# default to accept blindly:
-#   - numCandidates too low  -> fast, but the search gives up early and can
-#     miss the true nearest chunk entirely. This failure is INVISIBLE: you
-#     still get exactly `limit` results, all of them plausible, just not the
-#     best ones. Nothing logs, nothing errors, the bot is merely worse.
-#   - numCandidates too high -> better recall (asymptotically approaching an
-#     exhaustive search) but more graph traversal, more distance computations,
-#     more latency. On a live voice call that latency is heard.
-#
-# MongoDB's documented rule of thumb is to set numCandidates at least ~20x
-# `limit` (commonly quoted as 10-20x), which reportedly lands around 90-95%
-# recall overlap with an exact search while staying much faster. With
-# config.RETRIEVAL_TOP_K = 4 that's 80 candidates — trivial work for a corpus
-# this size, so we take the upper end of the range and buy the recall.
-#
-# The floor exists because the multiplier alone is silly for tiny limits:
-# 20 x limit=1 is 20 candidates, which is a very narrow beam. Atlas also
-# requires numCandidates >= limit; the floor makes violating that impossible.
-#
-# (There is an escape hatch for correctness-critical work: `"exact": true` on
-# the stage runs ENN — an exhaustive scan, perfect recall, no `numCandidates`
-# at all. Right for evaluating retrieval quality offline; wrong for a live
-# voice turn.)
 NUM_CANDIDATES_MULTIPLIER = 20
 MIN_NUM_CANDIDATES = 100
 
 
-# --- Lazy, one-time client construction --------------------------------------
-# Same pattern, and the same reasoning, as `embeddings.py::_get_client()`.
-#
-# Not built at import time, because `config.MONGODB_URI` may legitimately be
-# empty: importing `app.rag.store` to unit-test `_build_search_pipeline`, or
-# to let an editor index the package, must not require a database. Config
-# stays lenient; the module that needs the secret demands it at the point of
-# use via `config.require(...)`, so the failure names the missing variable
-# instead of surfacing as an opaque connection error from inside the driver.
-#
-# Built exactly once, because an `AsyncMongoClient` is not a connection — it
-# is a connection POOL plus a background topology monitor that keeps track of
-# which replica-set members are healthy. Constructing one per query would pay
-# TCP + TLS + auth handshakes every time and leak monitor tasks. It is
-# designed to be created once and shared for the life of the process.
 _client: AsyncMongoClient | None = None
 
-# A threading.Lock, not an asyncio.Lock — matching embeddings.py. The public
-# functions are coroutines, but an ingestion script may drive them from a
-# worker thread, and nothing stops two OS threads from entering `_get_client()`
-# simultaneously. Only a threading.Lock actually blocks the second thread.
-# Double-checked locking keeps the common path (client already built) free of
-# any lock acquisition at all.
 _client_lock = threading.Lock()
 
 
@@ -322,7 +197,6 @@ async def close_client() -> None:
         logger.info("MongoDB Atlas client closed.")
 
 
-# --- Writing -----------------------------------------------------------------
 async def upsert_chunks(collection_name: str, records: list[dict]) -> int:
     """Bulk-write chunk documents (each already carrying its embedding).
 
@@ -370,11 +244,6 @@ async def upsert_chunks(collection_name: str, records: list[dict]) -> int:
     if not records:
         raise ValueError("upsert_chunks() received an empty list — nothing to write.")
 
-    # Validate before touching the network. A document written without an
-    # embedding, or with the wrong width, is not a write error — Mongo is
-    # schemaless and accepts it happily. It simply never matches any vector
-    # search, forever, invisibly. Catching it here names the offending index
-    # instead of leaving a silent hole in the corpus.
     for position, record in enumerate(records):
         vector = record.get(EMBEDDING_FIELD)
         if not isinstance(vector, list) or not vector:
@@ -396,10 +265,6 @@ async def upsert_chunks(collection_name: str, records: list[dict]) -> int:
     try:
         result = await collection.insert_many(records, ordered=False)
     except PyMongoError as exc:
-        # Wrapped (unlike most driver errors in this file) because a bulk
-        # write failure mid-ingest needs a message that says WHICH collection
-        # and HOW MANY documents were in flight — `raise ... from exc` keeps
-        # the driver's own diagnostics attached underneath.
         raise VectorStoreError(
             f"Bulk insert of {len(records)} documents into "
             f"{config.MONGODB_DB_NAME}.{collection_name} failed: {exc}"
@@ -416,7 +281,6 @@ async def upsert_chunks(collection_name: str, records: list[dict]) -> int:
     return written
 
 
-# --- Query pipeline ----------------------------------------------------------
 def _build_search_pipeline(
     query_vector: list[float],
     limit: int,
@@ -503,9 +367,6 @@ def _build_search_pipeline(
         "limit": limit,
     }
 
-    # Only add `filter` when there is one. An empty `{}` is not equivalent to
-    # omitting the key — it makes Atlas do pre-filter work for a predicate
-    # that matches everything.
     if pre_filter:
         search_stage["filter"] = pre_filter
 
@@ -567,9 +428,6 @@ async def vector_search(
     if not query_vector:
         raise ValueError("vector_search() received an empty query vector.")
     if len(query_vector) != config.EMBEDDING_DIMENSION:
-        # Caught here it names both numbers. Left to Atlas, the error mentions
-        # only the query vector, sending you to read embeddings.py when the
-        # index may be what's stale.
         raise ValueError(
             f"vector_search() received a {len(query_vector)}-dimensional query "
             f"vector, but config.EMBEDDING_DIMENSION is "
@@ -580,18 +438,9 @@ async def vector_search(
     pipeline = _build_search_pipeline(query_vector, limit, pre_filter)
 
     try:
-        # TWO awaits, by design (see the module docstring): `aggregate(...)` is
-        # a coroutine that resolves to an AsyncCommandCursor, and `to_list()`
-        # is a second coroutine that drains it. `to_list()` rather than an
-        # `async for` loop because top-k is small and bounded — there is no
-        # streaming benefit, and a single await is easier to reason about.
         cursor = await collection.aggregate(pipeline)
         results = await cursor.to_list()
     except OperationFailure as exc:
-        # The overwhelmingly common cause is a missing/misnamed/still-building
-        # index, or a pre-filter on a field that wasn't declared as
-        # "type": "filter". Say so, because the raw server message rarely
-        # makes the fix obvious.
         raise VectorStoreError(
             f"$vectorSearch on {config.MONGODB_DB_NAME}.{collection_name} failed: {exc}. "
             f"Check that the Atlas Vector Search index {config.VECTOR_INDEX_NAME!r} "
@@ -610,7 +459,6 @@ async def vector_search(
     return results
 
 
-# --- Index management --------------------------------------------------------
 async def ensure_vector_index(collection_name: str) -> bool:
     """Create the vector search index on `collection_name` if it's missing.
 
@@ -641,14 +489,10 @@ async def ensure_vector_index(collection_name: str) -> bool:
     """
     collection = _get_collection(collection_name)
 
-    # Ask for the one index by name rather than listing them all and
-    # filtering client-side.
     try:
         cursor = await collection.list_search_indexes(config.VECTOR_INDEX_NAME)
         existing = await cursor.to_list()
     except PyMongoError as exc:
-        # Some deployments reject even *listing* search indexes. Treat that
-        # exactly like "can't create" rather than crashing startup.
         _log_manual_index_instructions(collection_name, f"could not list search indexes: {exc}")
         return False
 
@@ -667,10 +511,6 @@ async def ensure_vector_index(collection_name: str) -> bool:
             SearchIndexModel(
                 definition=VECTOR_INDEX_DEFINITION,
                 name=config.VECTOR_INDEX_NAME,
-                # Without type="vectorSearch" this silently creates an Atlas
-                # *Search* (full-text) index instead — the parameter defaults
-                # to "search". That index would then not serve $vectorSearch
-                # at all, while looking present in the UI.
                 type="vectorSearch",
             )
         )
@@ -678,12 +518,6 @@ async def ensure_vector_index(collection_name: str) -> bool:
         _log_manual_index_instructions(collection_name, str(exc))
         return False
 
-    # Creation is ASYNCHRONOUS on Atlas's side: the call returns as soon as
-    # the build is accepted, and the index moves PENDING -> BUILDING -> READY
-    # over the following seconds. Queries run against a not-yet-READY index
-    # return no results rather than an error — the classic "I just ingested
-    # everything and search returns nothing" panic. We deliberately don't
-    # block here (that would stall startup); we just say so.
     logger.info(
         "Created vector index %r on %s.%s. Atlas builds it asynchronously — "
         "searches may return no results until its status reaches READY.",
@@ -702,7 +536,7 @@ def _log_manual_index_instructions(collection_name: str, reason: str) -> None:
     definition this code expects — including `numDimensions`, which follows
     `config.EMBEDDING_DIMENSION` automatically.
     """
-    import json  # local: only needed on this cold, rare path.
+    import json
 
     logger.warning(
         "Could not create the Atlas Vector Search index programmatically (%s).\n"

@@ -90,89 +90,12 @@ from app import config
 logger = logging.getLogger(__name__)
 
 
-# --- Task types -------------------------------------------------------------
-# ASYMMETRIC EMBEDDING — the single most important idea in this file.
-#
-# The naive mental model of embeddings is "similar texts get similar vectors".
-# That model is wrong for retrieval, and believing it costs you recall.
-#
-# In a RAG system the two sides of a comparison are not the same kind of text.
-# One side is a short, under-specified question ("what's our refund policy?").
-# The other is a long, declarative passage that happens to *answer* it
-# ("Customers may return unopened items within 30 days of delivery..."). As
-# strings, those two are not very similar at all — different length, different
-# vocabulary, different grammatical mood. A model trained purely on "are these
-# two texts alike?" (that's what SEMANTIC_SIMILARITY optimises) would happily
-# rank the question closer to *another question* about refunds than to the
-# paragraph that actually answers it. Useless for retrieval.
-#
-# Retrieval-tuned embedding models are trained on a different objective:
-# question-passage pairs, pushing a query and its correct answer passage
-# together in vector space even though they don't look alike. `task_type` is
-# how you tell the model which *role* the text you're sending plays, so it can
-# project it into the right region of that shared space. Queries and documents
-# effectively get two different (but co-trained) projections — hence
-# "asymmetric".
-#
-# Both sides must be labelled consistently, and consistently over time:
-#   * text being STORED/indexed  -> RETRIEVAL_DOCUMENT
-#   * a question being SEARCHED  -> RETRIEVAL_QUERY
-#
-# What makes getting this wrong such a nasty bug is that nothing breaks. Pass
-# the wrong task_type, or omit it entirely, and you still get a vector of the
-# right length, Atlas still accepts it, `$vectorSearch` still returns exactly
-# top-k results, and the agent still answers. The results are just measurably
-# worse — the right chunk drops from rank 1 to rank 7 and falls off the end of
-# a top-4 cutoff. There is no exception, no log line, no failing test; the
-# only symptom is "the bot seems a bit dumb". That's why these are two
-# separate named functions instead of one function with a task_type argument:
-# a caller cannot accidentally leave it unset, and a code reviewer can see at
-# the call site which side of the asymmetry they're on.
-#
-# One more consequence: if you ever re-embed the corpus with a different
-# task_type (or a different model), you must re-embed *all* of it. A
-# collection holding a mix of document-typed and similarity-typed vectors is
-# comparing coordinates from two different spaces, which degrades quietly in
-# the same invisible way.
-#
-# CASING IS LOAD-BEARING under google-genai. These constants used to be
-# lowercase because the old SDK folded case for you; the new SDK forwards the
-# string untouched (see the module docstring), so they must be the exact
-# UPPER_SNAKE_CASE enum names or the API rejects the request.
 _TASK_DOCUMENT = "RETRIEVAL_DOCUMENT"
 _TASK_QUERY = "RETRIEVAL_QUERY"
 
 
-# --- Lazy, one-time client construction --------------------------------------
-# Under `google-genai` there is no module-global `configure()`; credentials and
-# transport live on a `genai.Client` instance, and every call is made through
-# it. So the thing we build exactly once and reuse is the client itself. Reuse
-# matters for more than tidiness: the client owns the underlying httpx
-# connection pool, so building a fresh one per embed call would throw away
-# keep-alive connections and pay a TLS handshake on every request.
-#
-# Why not build it at import time: `config.GOOGLE_API_KEY` may legitimately be
-# empty. Importing this module must stay free of side effects and free of
-# preconditions — a unit test that imports `app.rag.embeddings` to check a
-# helper, a `--help` invocation, or an editor's autocomplete indexing the
-# package should not explode because no .env exists. That's the whole point of
-# the `config.require(...)` pattern documented in app/config.py: config stays
-# lenient, and the module that actually *needs* a secret demands it at the
-# point of use, so the error names the missing variable instead of surfacing
-# as an opaque authentication failure from inside the HTTP layer three frames
-# deeper.
-#
-# (`genai.Client()` would also happily pick GOOGLE_API_KEY up from the process
-# environment on its own. We pass it explicitly through `config.require` anyway
-# so the missing-key failure is ours, is early, and names the variable.)
 _client: genai.Client | None = None
 
-# Same reasoning as faster_whisper_stt.py's `_model_lock`: a threading.Lock,
-# not an asyncio.Lock. Even though the public functions here are coroutines,
-# an ingestion script may drive them from a worker thread, and nothing stops
-# two OS threads from entering `_get_client()` at once. Only a threading.Lock
-# actually blocks the second thread. Double-checked locking keeps the common
-# case (client already built) free of lock acquisition.
 _client_lock = threading.Lock()
 
 
@@ -196,7 +119,6 @@ def _get_client() -> genai.Client:
     return _client
 
 
-# --- Post-processing ---------------------------------------------------------
 def _normalize(vector: list[float]) -> list[float]:
     """Scale a vector to unit length (L2 norm == 1).
 
@@ -216,9 +138,6 @@ def _normalize(vector: list[float]) -> list[float]:
     """
     norm = math.sqrt(sum(component * component for component in vector))
     if norm == 0.0:
-        # A genuinely all-zero embedding should never happen; if it does,
-        # dividing would raise ZeroDivisionError deep in a list comprehension.
-        # Fail loudly and specifically instead.
         raise RuntimeError(
             "Embedding API returned an all-zero vector — refusing to normalize it. "
             "This usually means the input text was empty or unusable."
@@ -245,21 +164,6 @@ def _validate(vector: list[float]) -> list[float]:
     return vector
 
 
-# --- Internal call -----------------------------------------------------------
-# Why async: this app is one asyncio event loop serving every live WebSocket
-# session at once. Embedding is a *network*-bound call (an HTTPS round trip to
-# Google, typically 100-400ms), not CPU-bound like
-# faster_whisper_stt.transcribe(). For network work the right tool is a native
-# async client, not `asyncio.to_thread` — awaiting it yields control back to
-# the loop for the whole flight time, so every other session keeps being
-# serviced, and it costs no worker thread. The installed SDK provides exactly
-# that as `client.aio.models.embed_content`, a real coroutine over
-# httpx.AsyncClient, so these functions are `async def` and must be awaited.
-# (Contrast: transcribe() is sync-and-blocking, so callers there must wrap it
-# in asyncio.to_thread. Different bottleneck, different tool.)
-#
-# For a synchronous context — e.g. a one-shot `python -m scripts.ingest_docs`
-# with no loop running — wrap the call: `asyncio.run(embed_documents(chunks))`.
 async def _embed(contents, task_type: str) -> list[list[float]]:
     """Call the SDK and return the raw vectors, always as a list of lists.
 
@@ -280,16 +184,10 @@ async def _embed(contents, task_type: str) -> list[list[float]]:
         contents=contents,
         config=types.EmbedContentConfig(
             task_type=task_type,
-            # Pin the width explicitly rather than relying on the model default,
-            # so the vectors always match the Atlas index. Models with a fixed
-            # output size ignore/accept this; flexible ones honour it.
             output_dimensionality=config.EMBEDDING_DIMENSION,
         ),
     )
 
-    # `embeddings` and `values` are both typed Optional on the response models,
-    # so a malformed/empty reply would otherwise surface as a `NoneType is not
-    # iterable` several lines later. Name the real problem instead.
     if not response.embeddings:
         raise RuntimeError(
             "Embedding API returned a response with no embeddings. "
@@ -307,7 +205,6 @@ async def _embed(contents, task_type: str) -> list[list[float]]:
     return vectors
 
 
-# --- Public API --------------------------------------------------------------
 async def embed_document(text: str) -> list[float]:
     """Embed one piece of text that is being STORED and indexed.
 
@@ -411,7 +308,6 @@ async def embed_documents(texts: list[str]) -> list[list[float]]:
 
     logger.debug("Embedding %d documents in a single batch request.", len(texts))
 
-    # Batch shape: one ContentEmbedding per input, in input order.
     vectors = await _embed(texts, _TASK_DOCUMENT)
 
     if len(vectors) != len(texts):

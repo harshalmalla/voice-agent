@@ -49,16 +49,8 @@ from app.audio.types import TranscriptionResult
 
 logger = logging.getLogger(__name__)
 
-# The value this provider stamps onto every TranscriptionResult it returns
-# (see `provider` in app/audio/types.py), so a caller holding a result can
-# tell which engine produced it. Same reasoning as faster_whisper_stt.py's
-# constant of the same name.
 PROVIDER_NAME = "sarvam"
 
-# A network call that never gets a response would otherwise hang this
-# coroutine (and whatever awaits it) forever. 30s comfortably covers a slow
-# STT/TTS round-trip for the short clips this app handles, without letting
-# one stuck request block a session indefinitely.
 _REQUEST_TIMEOUT_SECONDS = 30.0
 
 
@@ -76,18 +68,6 @@ class SarvamAPIError(RuntimeError):
     """
 
 
-# --- Language code adapter --------------------------------------------------
-# faster-whisper (and this app's shared TranscriptionResult.language field,
-# see app/audio/types.py) speaks plain ISO 639-1 codes: "hi", "ta", "bn", ...
-# Sarvam's API speaks BCP-47-ish codes instead: "hi-IN", "ta-IN", "bn-IN", ...
-# (confirmed at https://docs.sarvam.ai/api/api-guides-tutorials/speech-to-text/how-to/specify-language-codes).
-# Two vendors' APIs virtually never agree on code formats, so rather than
-# assume one and find out we're wrong at runtime, we maintain a small
-# explicit adapter dict at the integration boundary — this is a common
-# integration reality, not something specific to Sarvam.
-#
-# Only languages Sarvam's docs actually list for text-to-speech (Bulbul)
-# are mapped here; extend this as Sarvam adds language support.
 WHISPER_TO_SARVAM_LANGUAGE: dict[str, str] = {
     "en": "en-IN",
     "hi": "hi-IN",
@@ -99,16 +79,9 @@ WHISPER_TO_SARVAM_LANGUAGE: dict[str, str] = {
     "mr": "mr-IN",
     "gu": "gu-IN",
     "pa": "pa-IN",
-    # Odia is the sharpest example of why this mapping has to be explicit
-    # rather than assumed: ISO 639-1 (what faster-whisper reports) is "or",
-    # but Sarvam's own docs use "od-IN" — the vendors don't even agree on
-    # the *base* two-letter code, not just the region suffix.
     "or": "od-IN",
 }
 
-# Built by inverting the dict above, instead of writing a second dict by
-# hand, so the two directions can never silently drift out of sync with
-# each other as languages are added.
 SARVAM_TO_WHISPER_LANGUAGE: dict[str, str] = {
     sarvam_code: whisper_code for whisper_code, sarvam_code in WHISPER_TO_SARVAM_LANGUAGE.items()
 }
@@ -184,10 +157,6 @@ async def transcribe(audio_bytes: bytes) -> TranscriptionResult:
     if not audio_bytes:
         raise ValueError("transcribe() received empty audio_bytes — nothing to transcribe.")
 
-    # Called here, at the point of use, rather than at module import time —
-    # see require()'s own docstring in app/config.py: importing this module
-    # should never crash just because no .env exists yet, only actually
-    # trying to call Sarvam should.
     api_key = config.require(config.SARVAM_API_KEY, "SARVAM_API_KEY")
 
     url = f"{config.SARVAM_API_BASE_URL}/speech-to-text"
@@ -200,9 +169,6 @@ async def transcribe(audio_bytes: bytes) -> TranscriptionResult:
 
     logger.debug("Sending %d bytes to Sarvam speech-to-text (model=%s)", len(audio_bytes), config.SARVAM_STT_MODEL)
 
-    # Native `await` on an I/O-bound call — no asyncio.to_thread needed; see
-    # this module's docstring for why that's the correct call here, unlike
-    # in faster_whisper_stt.py.
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         response = await client.post(url, headers=headers, data=data, files=files)
 
@@ -285,9 +251,6 @@ async def synthesize_speech(text: str, language_code: str) -> bytes:
         len(text),
     )
 
-    # Native `await`, same reasoning as transcribe() above: this is purely
-    # waiting on a network response, so the event loop stays free to serve
-    # other sessions for the whole wait instead of tying up a worker thread.
     async with httpx.AsyncClient(timeout=_REQUEST_TIMEOUT_SECONDS) as client:
         response = await client.post(url, headers=headers, json=body)
 
