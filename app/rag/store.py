@@ -586,6 +586,19 @@ async def ensure_vector_index(collection_name: str) -> bool:
     collection = _get_collection(collection_name)
 
     try:
+        database = _get_client()[config.MONGODB_DB_NAME]
+        if collection_name not in await database.list_collection_names():
+            await database.create_collection(collection_name)
+            logger.info(
+                "Created empty collection %s.%s so its vector index can be built.",
+                config.MONGODB_DB_NAME,
+                collection_name,
+            )
+    except PyMongoError as exc:
+        _log_manual_index_instructions(collection_name, f"could not create the collection: {exc}")
+        return False
+
+    try:
         cursor = await collection.list_search_indexes(config.VECTOR_INDEX_NAME)
         existing = await cursor.to_list()
     except PyMongoError as exc:
