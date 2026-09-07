@@ -36,6 +36,7 @@ const state = {
   timerInterval: null,
   recordingStartedAt: 0,
   awaitingRegionalAudio: false,
+  serverTtsForEnglish: false,
   voice: null,
 };
 
@@ -160,10 +161,13 @@ const eventHandlers = {
       raw: payload,
     });
   },
+  session_config(payload) {
+    state.serverTtsForEnglish = Boolean(payload.server_tts_for_english);
+  },
   agent_answer(payload) {
     resolvePendingAgentTurn(payload.text);
     const isRegional = payload.language && payload.language !== "en";
-    if (isRegional) {
+    if (isRegional || state.serverTtsForEnglish) {
       state.awaitingRegionalAudio = true;
     } else {
       speak(payload.text);

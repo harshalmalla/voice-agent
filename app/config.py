@@ -36,6 +36,7 @@ SARVAM_API_BASE_URL = os.getenv("SARVAM_API_BASE_URL", "https://api.sarvam.ai")
 SARVAM_STT_MODEL = os.getenv("SARVAM_STT_MODEL", "saaras:v3")
 SARVAM_TTS_MODEL = os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")
 SARVAM_TTS_SPEAKER = os.getenv("SARVAM_TTS_SPEAKER", "shubh")
+SARVAM_TTS_FOR_ENGLISH = os.getenv("SARVAM_TTS_FOR_ENGLISH", "false").strip().lower() in ("1", "true", "yes", "on")
 
 MONGODB_DB_NAME = os.getenv("MONGODB_DB_NAME", "voice_agent")
 DOCUMENTS_COLLECTION = "documents"

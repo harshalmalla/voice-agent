@@ -265,8 +265,25 @@ async def _answer_and_speak(session_id: str, user_text: str, language: str) -> N
     """
     answer_text = await gemini_agent.answer(session_id, user_text, language)
 
-    if answer_text and language != ENGLISH:
+    if answer_text and _server_speaks(language):
         await _speak(session_id, answer_text, language)
+
+
+def _server_speaks(language: str) -> bool:
+    """Whether this turn's reply is synthesized here rather than in the browser.
+
+    Regional languages always are: the browser's speechSynthesis has patchy
+    and inconsistent Indian-language voice support, while Sarvam's is good.
+    English is the toggle. The browser path is free, instant and costs no
+    quota, but its default voices sound noticeably synthetic; setting
+    SARVAM_TTS_FOR_ENGLISH routes English through Sarvam too, trading an API
+    call and some latency per reply for a uniformly better voice.
+
+    The client is told which mode is in force when it connects, because it
+    cannot infer it: on receiving an answer it must either speak the text
+    itself or wait for the audio, and doing both would talk over itself.
+    """
+    return language != ENGLISH or config.SARVAM_TTS_FOR_ENGLISH
 
 
 async def _process_audio_turn(session_id: str, audio: bytes) -> None:
@@ -526,6 +543,14 @@ async def voice_session(websocket: WebSocket, session_id: str) -> None:
     state = manager.get_or_create(session_id)
 
     logger.info("WebSocket session %s connected.", session_id)
+
+    manager.emit(
+        session_id,
+        {
+            "type": "session_config",
+            "server_tts_for_english": config.SARVAM_TTS_FOR_ENGLISH,
+        },
+    )
 
     receive_task = asyncio.create_task(
         _receive_loop(websocket, session_id), name=f"receive-{session_id}"

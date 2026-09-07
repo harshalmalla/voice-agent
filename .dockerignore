@@ -1,0 +1,38 @@
+# Keep the build context small and keep secrets out of the image.
+
+# Virtual environments — host-built, wrong platform, and huge.
+.venv/
+venv/
+env/
+
+# Secrets. .env is mounted at run time with --env-file, never baked in.
+.env
+.env.*
+!.env.example
+
+# Version control and editor state
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Your own source documents. They belong in the vector store, not in the
+# image; ingestion runs against Atlas and the container reads nothing from
+# this directory at run time. data/notes.md IS kept — the read_notes tool
+# reads it from disk.
+data/documents/*
+!data/documents/.gitkeep
+
+# OS cruft and logs
+.DS_Store
+Thumbs.db
+*.log
+logs/
