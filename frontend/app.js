@@ -36,6 +36,7 @@ const state = {
   timerInterval: null,
   recordingStartedAt: 0,
   awaitingRegionalAudio: false,
+  voice: null,
 };
 
 function sessionId() {
@@ -405,10 +406,43 @@ function showBanner(kind, message) {
   dom.banners.append(banner);
 }
 
+const PREFERRED_VOICE_PATTERNS = [
+  /Google US English/i,
+  /Samantha/i,
+  /Ava/i,
+  /Allison/i,
+  /Serena/i,
+  /Daniel/i,
+  /Karen/i,
+];
+
+function pickVoice() {
+  const voices = window.speechSynthesis?.getVoices() ?? [];
+  if (!voices.length) return null;
+
+  const english = voices.filter((voice) => voice.lang.toLowerCase().startsWith("en"));
+  for (const pattern of PREFERRED_VOICE_PATTERNS) {
+    const match = english.find((voice) => pattern.test(voice.name));
+    if (match) return match;
+  }
+  return english.find((voice) => voice.lang === "en-US") ?? english[0] ?? null;
+}
+
+function refreshVoice() {
+  state.voice = pickVoice();
+}
+
 function speak(text) {
   if (state.muted || !text || !("speechSynthesis" in window)) return;
   window.speechSynthesis.cancel();
-  window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  if (!state.voice) refreshVoice();
+  if (state.voice) utterance.voice = state.voice;
+  utterance.rate = 1.02;
+  utterance.pitch = 1.0;
+
+  window.speechSynthesis.speak(utterance);
 }
 
 function playAudio(base64) {
@@ -560,6 +594,9 @@ dom.clearActivity.addEventListener("click", () => {
   empty.textContent = "Retrieval hits, tool calls and results appear here as the agent works.";
   dom.activity.append(empty);
 });
+
+window.speechSynthesis?.addEventListener("voiceschanged", refreshVoice);
+refreshVoice();
 
 dom.sessionLabel.textContent = `Session ${sessionId().slice(0, 8)}`;
 setControlsEnabled(false);
