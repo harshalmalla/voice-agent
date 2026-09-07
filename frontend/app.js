@@ -547,8 +547,6 @@ dom.textForm.addEventListener("submit", (event) => {
   const text = dom.textInput.value.trim();
   if (!text) return;
   if (send(JSON.stringify({ type: "text_query", text }))) {
-    addUserTurn(text, null, "typed");
-    addPendingAgentTurn();
     dom.textInput.value = "";
   }
 });
