@@ -188,6 +188,19 @@ Open <http://localhost:8000>, allow microphone access, hold the mic button and
 ask a question grounded in one of your documents. The activity panel shows the
 retrieved chunks and any tool calls as they happen.
 
+### 6. Run the tests
+
+```bash
+pytest tests/ -v
+```
+
+`test_chunking.py` and most of `test_tools.py` are pure unit tests with no
+external calls. `test_smoke_ws.py` boots the real app (Atlas indexes and all)
+and drives one full turn over `/ws/{session_id}` using the typed `text_query`
+path — the same one the pipeline is testable with when no microphone is
+available — so it calls the live Gemini and Atlas APIs and is skipped
+automatically if `GOOGLE_API_KEY` or `MONGODB_URI` is not set.
+
 ---
 
 ## Design decisions
@@ -277,7 +290,6 @@ all; they return their failure as a string the model can act on.
 - **The frontend is Chrome-centric.** `MediaRecorder` output formats and
   `speechSynthesis` voice availability vary considerably across browsers;
   development and testing were done in Chrome.
-- **No automated test suite yet.** `tests/` is scaffolded but empty.
 - Push-to-talk, not continuous streaming. Whisper is not a streaming model,
   and partial-ASR streaming is a materially harder problem than the rest of
   this project.
