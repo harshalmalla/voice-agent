@@ -36,3 +36,8 @@ dist/
 # Logs
 *.log
 logs/
+
+# Kept locally, not published to GitHub
+PLAN.md
+data/notes.md
+tests/
